@@ -1,5 +1,8 @@
 // http://www.rkoucha.fr/tech_corner/pty_pdip.html
 
+#include "log.h"
+#include "tcp_client.hpp"
+
 #define _XOPEN_SOURCE 600
 #include <errno.h>
 #include <fcntl.h>
@@ -12,10 +15,42 @@
 #include <sys/select.h>
 #include <termios.h>
 
+static std::unique_ptr<asio::io_context> s_io_context;
+static std::unique_ptr<asio_net::tcp_client> s_tcp_client;
+
+void init() {
+  s_io_context = std::make_unique<asio::io_context>();
+  s_tcp_client = std::make_unique<asio_net::tcp_client>(*s_io_context);
+  s_tcp_client->on_open = [] {
+    LOGD("on_open");
+    s_tcp_client->send("opened");
+  };
+  s_tcp_client->on_close = [] {
+    LOGD("on_close");
+  };
+  s_tcp_client->on_data = [](const std::string &data) {
+    LOGD("on_data: %s", data.c_str());
+  };
+  s_tcp_client->open("localhost", 6666);
+  LOGD("try open...");
+}
+
 int main(int ac, char *av[]) {
   int fdm, fds;
   int rc;
   char input[150];
+
+  init();
+
+  asio::io_context::work work(*s_io_context);
+  s_io_context->run();
+  LOGD("end...");
+
+  std::thread([]{
+    asio::io_context::work work(*s_io_context);
+    s_io_context->run();
+    LOGD("end...");
+  }).detach();
 
   // Check arguments
   if (ac <= 1) {
@@ -53,13 +88,13 @@ int main(int ac, char *av[]) {
     // Close the slave side of the PTY
     close(fds);
 
-    while (1) {
+    while (true) {
       // Wait for data from standard input and master side of PTY
       FD_ZERO(&fd_in);
       FD_SET(0, &fd_in);
       FD_SET(fdm, &fd_in);
 
-      rc = select(fdm + 1, &fd_in, NULL, NULL, NULL);
+      rc = select(fdm + 1, &fd_in, nullptr, nullptr, nullptr);
       switch (rc) {
         case -1:
           fprintf(stderr, "Error %d on select()\n", errno);
@@ -146,7 +181,7 @@ int main(int ac, char *av[]) {
       for (i = 1; i < ac; i++) {
         child_av[i - 1] = strdup(av[i]);
       }
-      child_av[i - 1] = NULL;
+      child_av[i - 1] = nullptr;
       rc = execvp(child_av[0], child_av);
     }
 

@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(terminal_server)
+set(CMAKE_CXX_STANDARD 14)
+add_compile_options(-Wall)
 
+project(terminal_server)
