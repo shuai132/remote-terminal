@@ -3,166 +3,132 @@
 #include "log.h"
 #include "tcp_client.hpp"
 
-#define _XOPEN_SOURCE 600
-#include <errno.h>
+#define _XOPEN_SOURCE 600  // NOLINT
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#define __USE_BSD
-#include <string.h>
 #include <sys/ioctl.h>
-#include <sys/select.h>
 #include <termios.h>
+#include <unistd.h>
 
-int main(int ac, char *av[]) {
-  int fdm, fds;
-  int rc;
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
-  // Check arguments
-  if (ac <= 1) {
-    fprintf(stderr, "Usage: %s program_name [parameters]\n", av[0]);
+static void portIO(int fdm) {
+  asio::io_context io_context;
+  asio_net::tcp_client tcp_client(io_context);
+
+  tcp_client.on_open = [] {
+    LOGD("on_open");
+  };
+  tcp_client.on_close = [] {
+    LOGD("on_close");
+  };
+  tcp_client.on_open_failed = [](std::error_code ec) {
+    LOGD("on_open_failed: %s", ec.message().c_str());
+  };
+  tcp_client.on_data = [fdm](const std::string &data) {
+    write(fdm, data.data(), data.size());
+  };
+  tcp_client.open("localhost", 6666);
+  LOGD("try open...");
+
+  asio::posix::stream_descriptor descriptor(io_context);
+  descriptor.assign(fdm);
+
+  std::function<void()> readFromFdm;
+  {
+    std::string buffer;
+    buffer.resize(1024);
+    readFromFdm = [&] {
+      descriptor.async_read_some(asio::buffer(buffer), [&](const std::error_code &ec, std::size_t length) {
+        readFromFdm();
+        tcp_client.send(std::string(buffer.data(), length));
+      });
+    };
+  }
+  readFromFdm();
+
+  asio::io_context::work work(io_context);
+  io_context.run();
+}
+
+static void execNewTerm(int fds, char *argv[]) {
+  struct termios slave_orig_term_settings;  // Saved terminal settings   // NOLINT
+  struct termios new_term_settings;         // Current terminal settings // NOLINT
+
+  // Save the defaults parameters of the slave side of the PTY
+  if (tcgetattr(fds, &slave_orig_term_settings) != 0) {
+    LOGE("tcgetattr error: %d, %s", errno, strerror(errno));
+  }
+
+  // Set RAW mode on slave side of PTY
+  new_term_settings = slave_orig_term_settings;
+  cfmakeraw(&new_term_settings);
+  tcsetattr(fds, TCSANOW, &new_term_settings);
+
+  // The slave side of the PTY becomes the standard input and outputs of the
+  // child process
+  close(0);  // Close standard input (current terminal)
+  close(1);  // Close standard output (current terminal)
+  close(2);  // Close standard error (current terminal)
+
+  dup(fds);  // PTY becomes standard input (0)
+  dup(fds);  // PTY becomes standard output (1)
+  dup(fds);  // PTY becomes standard error (2)
+
+  // Now the original file descriptor is useless
+  close(fds);
+
+  // Make the current process a new session leader
+  setsid();
+
+  // As the child is a session leader, set the controlling terminal to be the
+  // slave side of the PTY (Mandatory for programs like the shell to make them
+  // manage correctly their outputs)
+  ioctl(0, TIOCSCTTY, 1);
+
+  // Execution of the program
+  int rc = execvp("bash", argv + 1);
+  if (rc != 0) {
+    LOGE("execvp error: %d, %s", errno, strerror(errno));
+  }
+  (void)rc;
+}
+
+int main(int argc, char *argv[]) {
+  if (argc <= 1) {
+    LOGE("Usage: %s program_name [parameters]\n", argv[0]);
     exit(1);
   }
 
-  fdm = posix_openpt(O_RDWR);
+  int fdm = posix_openpt(O_RDWR);
   if (fdm < 0) {
-    fprintf(stderr, "Error %d on posix_openpt()\n", errno);
+    LOGE("posix_openpt error: %d, %s", errno, strerror(errno));
     return 1;
   }
 
-  rc = grantpt(fdm);
-  if (rc != 0) {
-    fprintf(stderr, "Error %d on grantpt()\n", errno);
+  if (grantpt(fdm) != 0) {
+    LOGE("grantpt error: %d, %s", errno, strerror(errno));
     return 1;
   }
 
-  rc = unlockpt(fdm);
-  if (rc != 0) {
-    fprintf(stderr, "Error %d on unlockpt()\n", errno);
+  if (unlockpt(fdm) != 0) {
+    LOGE("unlockpt error: %d, %s", errno, strerror(errno));
     return 1;
   }
 
   // Open the slave side ot the PTY
-  fds = open(ptsname(fdm), O_RDWR);
+  int fds = open(ptsname(fdm), O_RDWR);
 
-  // Create the child process
   if (fork()) {
     // FATHER
-
-    // Close the slave side of the PTY
     close(fds);
-
-    static std::unique_ptr<asio::io_context> s_io_context;
-    static std::unique_ptr<asio_net::tcp_client> s_tcp_client;
-
-    s_io_context = std::make_unique<asio::io_context>();
-    s_tcp_client = std::make_unique<asio_net::tcp_client>(*s_io_context);
-    s_tcp_client->on_open = [] {
-      LOGD("on_open");
-    };
-    s_tcp_client->on_close = [] {
-      LOGD("on_close");
-    };
-    s_tcp_client->on_data = [fdm](const std::string &data) {
-      LOGD("on_data: %s", data.c_str());
-      write(fdm, data.data(), data.size());
-    };
-    s_tcp_client->open("localhost", 6666);
-    LOGD("try open...");
-
-    std::thread([fdm] {
-      fd_set fd_in;
-      int rc;
-      while (true) {
-        // Wait for data from standard input and master side of PTY
-        FD_ZERO(&fd_in);
-        FD_SET(0, &fd_in);
-        FD_SET(fdm, &fd_in);
-
-        rc = select(fdm + 1, &fd_in, nullptr, nullptr, nullptr);
-        switch (rc) {
-          case -1:
-            fprintf(stderr, "Error %d on select()\n", errno);
-            exit(1);
-
-          default: {
-            // If data on master side of PTY
-            if (FD_ISSET(fdm, &fd_in)) {
-              char input[150];
-              rc = read(fdm, input, sizeof(input));
-              if (rc > 0) {
-                s_tcp_client->send(std::string(input, rc));
-              } else {
-                if (rc < 0) {
-                  fprintf(stderr, "Error %d on read master PTY\n", errno);
-                  exit(1);
-                }
-              }
-            }
-          }
-        }  // End switch
-      }    // End while
-    }).detach();
-
-    asio::io_context::work work(*s_io_context);
-    s_io_context->run();
+    portIO(fdm);
   } else {
-    struct termios slave_orig_term_settings;  // Saved terminal settings
-    struct termios new_term_settings;         // Current terminal settings
-
     // CHILD
-
-    // Close the master side of the PTY
     close(fdm);
-
-    // Save the defaults parameters of the slave side of the PTY
-    rc = tcgetattr(fds, &slave_orig_term_settings);
-
-    // Set RAW mode on slave side of PTY
-    new_term_settings = slave_orig_term_settings;
-#ifndef __APPLE__
-    cfmakeraw(&new_term_settings);
-#endif
-    tcsetattr(fds, TCSANOW, &new_term_settings);
-
-    // The slave side of the PTY becomes the standard input and outputs of the
-    // child process
-    close(0);  // Close standard input (current terminal)
-    close(1);  // Close standard output (current terminal)
-    close(2);  // Close standard error (current terminal)
-
-    dup(fds);  // PTY becomes standard input (0)
-    dup(fds);  // PTY becomes standard output (1)
-    dup(fds);  // PTY becomes standard error (2)
-
-    // Now the original file descriptor is useless
-    close(fds);
-
-    // Make the current process a new session leader
-    setsid();
-
-    // As the child is a session leader, set the controlling terminal to be the
-    // slave side of the PTY (Mandatory for programs like the shell to make them
-    // manage correctly their outputs)
-    ioctl(0, TIOCSCTTY, 1);
-
-    // Execution of the program
-    {
-      char **child_av;
-      int i;
-
-      // Build the command line
-      child_av = (char **)malloc(ac * sizeof(char *));
-      for (i = 1; i < ac; i++) {
-        child_av[i - 1] = strdup(av[i]);
-      }
-      child_av[i - 1] = nullptr;
-      rc = execvp(child_av[0], child_av);
-    }
-
-    // if Error...
-    return 1;
+    execNewTerm(fds, argv);
   }
 
   return 0;
