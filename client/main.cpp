@@ -1,5 +1,3 @@
-// http://www.rkoucha.fr/tech_corner/pty_pdip.html
-
 #include "log.h"
 #include "tcp_client.hpp"
 
@@ -93,7 +91,6 @@ static void execNewTerm(int fds, char *argv[]) {
   if (rc != 0) {
     LOGE("execvp error: %d, %s", errno, strerror(errno));
   }
-  (void)rc;
 }
 
 int main(int argc, char *argv[]) {
