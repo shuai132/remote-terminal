@@ -35,16 +35,14 @@ static void portIO(int fdm) {
   descriptor.assign(fdm);
 
   std::function<void()> readFromFdm;
-  {
-    std::string buffer;
-    buffer.resize(1024);
-    readFromFdm = [&] {
-      descriptor.async_read_some(asio::buffer(buffer), [&](const std::error_code &ec, std::size_t length) {
-        readFromFdm();
-        tcp_client.send(std::string(buffer.data(), length));
-      });
-    };
-  }
+  std::string buffer;
+  buffer.resize(1024);
+  readFromFdm = [&] {
+    descriptor.async_read_some(asio::buffer(buffer), [&](const std::error_code &ec, std::size_t length) {
+      readFromFdm();
+      tcp_client.send(std::string(buffer.data(), length));
+    });
+  };
   readFromFdm();
 
   asio::io_context::work work(io_context);
