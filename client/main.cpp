@@ -15,42 +15,9 @@
 #include <sys/select.h>
 #include <termios.h>
 
-static std::unique_ptr<asio::io_context> s_io_context;
-static std::unique_ptr<asio_net::tcp_client> s_tcp_client;
-
-void init() {
-  s_io_context = std::make_unique<asio::io_context>();
-  s_tcp_client = std::make_unique<asio_net::tcp_client>(*s_io_context);
-  s_tcp_client->on_open = [] {
-    LOGD("on_open");
-    s_tcp_client->send("opened");
-  };
-  s_tcp_client->on_close = [] {
-    LOGD("on_close");
-  };
-  s_tcp_client->on_data = [](const std::string &data) {
-    LOGD("on_data: %s", data.c_str());
-  };
-  s_tcp_client->open("localhost", 6666);
-  LOGD("try open...");
-}
-
 int main(int ac, char *av[]) {
   int fdm, fds;
   int rc;
-  char input[150];
-
-  init();
-
-  asio::io_context::work work(*s_io_context);
-  s_io_context->run();
-  LOGD("end...");
-
-  std::thread([]{
-    asio::io_context::work work(*s_io_context);
-    s_io_context->run();
-    LOGD("end...");
-  }).detach();
 
   // Check arguments
   if (ac <= 1) {
@@ -81,56 +48,65 @@ int main(int ac, char *av[]) {
 
   // Create the child process
   if (fork()) {
-    fd_set fd_in;
-
     // FATHER
 
     // Close the slave side of the PTY
     close(fds);
 
-    while (true) {
-      // Wait for data from standard input and master side of PTY
-      FD_ZERO(&fd_in);
-      FD_SET(0, &fd_in);
-      FD_SET(fdm, &fd_in);
+    static std::unique_ptr<asio::io_context> s_io_context;
+    static std::unique_ptr<asio_net::tcp_client> s_tcp_client;
 
-      rc = select(fdm + 1, &fd_in, nullptr, nullptr, nullptr);
-      switch (rc) {
-        case -1:
-          fprintf(stderr, "Error %d on select()\n", errno);
-          exit(1);
+    s_io_context = std::make_unique<asio::io_context>();
+    s_tcp_client = std::make_unique<asio_net::tcp_client>(*s_io_context);
+    s_tcp_client->on_open = [] {
+      LOGD("on_open");
+    };
+    s_tcp_client->on_close = [] {
+      LOGD("on_close");
+    };
+    s_tcp_client->on_data = [fdm](const std::string &data) {
+      LOGD("on_data: %s", data.c_str());
+      write(fdm, data.data(), data.size());
+    };
+    s_tcp_client->open("localhost", 6666);
+    LOGD("try open...");
 
-        default: {
-          // If data on standard input
-          if (FD_ISSET(0, &fd_in)) {
-            rc = read(0, input, sizeof(input));
-            if (rc > 0) {
-              // Send data on the master side of PTY
-              write(fdm, input, rc);
-            } else {
-              if (rc < 0) {
-                fprintf(stderr, "Error %d on read standard input\n", errno);
-                exit(1);
+    std::thread([fdm] {
+      fd_set fd_in;
+      int rc;
+      while (true) {
+        // Wait for data from standard input and master side of PTY
+        FD_ZERO(&fd_in);
+        FD_SET(0, &fd_in);
+        FD_SET(fdm, &fd_in);
+
+        rc = select(fdm + 1, &fd_in, nullptr, nullptr, nullptr);
+        switch (rc) {
+          case -1:
+            fprintf(stderr, "Error %d on select()\n", errno);
+            exit(1);
+
+          default: {
+            // If data on master side of PTY
+            if (FD_ISSET(fdm, &fd_in)) {
+              char input[150];
+              rc = read(fdm, input, sizeof(input));
+              if (rc > 0) {
+                s_tcp_client->send(std::string(input, rc));
+              } else {
+                if (rc < 0) {
+                  fprintf(stderr, "Error %d on read master PTY\n", errno);
+                  exit(1);
+                }
               }
             }
           }
+        }  // End switch
+      }    // End while
+    }).detach();
 
-          // If data on master side of PTY
-          if (FD_ISSET(fdm, &fd_in)) {
-            rc = read(fdm, input, sizeof(input));
-            if (rc > 0) {
-              // Send data on standard output
-              write(1, input, rc);
-            } else {
-              if (rc < 0) {
-                fprintf(stderr, "Error %d on read master PTY\n", errno);
-                exit(1);
-              }
-            }
-          }
-        }
-      }  // End switch
-    }    // End while
+    asio::io_context::work work(*s_io_context);
+    s_io_context->run();
   } else {
     struct termios slave_orig_term_settings;  // Saved terminal settings
     struct termios new_term_settings;         // Current terminal settings
