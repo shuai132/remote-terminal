@@ -11,49 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 
-static void portIO(int fdm) {
-  asio::io_context io_context;
-  asio_net::tcp_client tcp_client(io_context);
-
-  tcp_client.on_open = [] {
-    LOGD("on_open");
-  };
-  tcp_client.on_close = [] {
-    LOGD("on_close");
-  };
-  tcp_client.on_open_failed = [](std::error_code ec) {
-    LOGD("on_open_failed: %s", ec.message().c_str());
-  };
-  tcp_client.on_data = [fdm](const std::string &data) {
-    write(fdm, data.data(), data.size());
-  };
-  tcp_client.open("localhost", 6666);
-  LOGD("try open...");
-
-  asio::posix::stream_descriptor descriptor(io_context);
-  descriptor.assign(fdm);
-
-  std::function<void()> readFromFdm;
-  std::string buffer;
-  buffer.resize(1024);
-  readFromFdm = [&] {
-    descriptor.async_read_some(asio::buffer(buffer), [&](const std::error_code &ec, std::size_t length) {
-      if (ec) {
-        LOGE("descriptor: %s", ec.message().c_str());
-        io_context.stop();
-        return;
-      }
-      tcp_client.send(std::string(buffer.data(), length));
-      readFromFdm();
-    });
-  };
-  readFromFdm();
-
-  asio::io_context::work work(io_context);
-  io_context.run();
-}
-
-static void execNewTerm(int fds, char *argv[]) {
+static void execNewTerm(int fds) {
   winsize winSize{.ws_row = 24, .ws_col = 80};
   ioctl(fds, TIOCSWINSZ, &winSize);
 
@@ -79,7 +37,7 @@ static void execNewTerm(int fds, char *argv[]) {
   ioctl(0, TIOCSCTTY, 1);
 
   // Execution of the program
-  int rc = execvp("bash", argv + 1);
+  int rc = execvp("bash", nullptr);
   if (rc != 0) {
     LOGE("execvp error: %d, %s", errno, strerror(errno));
   }
@@ -105,15 +63,49 @@ int main(int argc, char *argv[]) {
   // Open the slave side ot the PTY
   int fds = open(ptsname(fdm), O_RDWR);
 
-  if (fork()) {
-    // FATHER
-    close(fds);
-    portIO(fdm);
-  } else {
-    // CHILD
-    close(fdm);
-    execNewTerm(fds, argv);
-  }
+  asio::io_context io_context;
+  asio_net::tcp_client tcp_client(io_context);
+
+  asio::posix::stream_descriptor descriptor(io_context);
+  descriptor.assign(fdm);
+
+  std::function<void()> readFromFdm;
+  std::string buffer;
+  buffer.resize(1024);
+  readFromFdm = [&] {
+    descriptor.async_read_some(asio::buffer(buffer), [&](const std::error_code &ec, std::size_t length) {
+      if (ec) {
+        LOGE("descriptor: %s", ec.message().c_str());
+        io_context.stop();
+        return;
+      }
+      tcp_client.send(std::string(buffer.data(), length));
+      readFromFdm();
+    });
+  };
+  readFromFdm();
+
+  tcp_client.on_open = [fds, &io_context] {
+    LOGD("on_open");
+    if (!fork()) {
+      io_context.stop();
+      execNewTerm(fds);
+    }
+  };
+  tcp_client.on_close = [] {
+    LOGD("on_close");
+  };
+  tcp_client.on_open_failed = [](std::error_code ec) {
+    LOGD("on_open_failed: %s", ec.message().c_str());
+  };
+  tcp_client.on_data = [fdm](const std::string &data) {
+    write(fdm, data.data(), data.size());
+  };
+  tcp_client.open("localhost", 6666);
+  LOGD("try open...");
+
+  asio::io_context::work work(io_context);
+  io_context.run();
 
   return 0;
-}  // main
+}
