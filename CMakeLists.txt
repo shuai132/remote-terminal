@@ -13,5 +13,9 @@ include_directories(thirdparty/asio/include)
 add_subdirectory(thirdparty/asio_net asio_net EXCLUDE_FROM_ALL)
 target_include_directories(asio_net INTERFACE ../thirdparty/asio/include)
 
+# log
+include_directories(common)
+
 add_subdirectory(client)
 add_subdirectory(server)
+add_subdirectory(demo)
