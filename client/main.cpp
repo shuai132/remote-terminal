@@ -87,9 +87,13 @@ int main(int argc, char *argv[]) {
 
   tcp_client.on_open = [fds, &io_context] {
     LOGD("on_open");
+    io_context.notify_fork(asio::execution_context::fork_prepare);
     if (!fork()) {
+      io_context.notify_fork(asio::execution_context::fork_child);
       io_context.stop();
       execNewTerm(fds);
+    } else {
+      io_context.notify_fork(asio::execution_context::fork_parent);
     }
   };
   tcp_client.on_close = [] {
